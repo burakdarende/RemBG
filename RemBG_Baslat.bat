@@ -1,45 +1,57 @@
 @echo off
-title RemBG Pro — Arkaplan Silici
-color 0A
-cd /d "%~dp0"
+setlocal EnableDelayedExpansion
+title RemBG Pro
+
+:: Bat'in bulundugu klasore git (her durumda calisir)
+set "SCRIPT_DIR=%~dp0"
+cd /d "%SCRIPT_DIR%"
 
 echo.
 echo  ============================================
-echo    RemBG Pro — Gelismis Arkaplan Silici
-echo         Neon / Tel Kafes / Fotograf
+echo    RemBG Pro -- Gelismis Arkaplan Silici
 echo  ============================================
 echo.
+echo  Klasor: %SCRIPT_DIR%
+echo.
 
-:: Venv varsa onu kullan, yoksa sistem Python
-if exist ".venv\Scripts\python.exe" (
-    set PYTHON=.venv\Scripts\python.exe
-    echo  [OK] Sanal ortam (venv) bulundu.
+:: Venv'i kontrol et
+set "VENV_PYTHON=%SCRIPT_DIR%.venv\Scripts\python.exe"
+
+if exist "%VENV_PYTHON%" (
+    echo  [OK] Sanal ortam bulundu.
+    set "PYTHON=%VENV_PYTHON%"
 ) else (
-    python --version >nul 2>&1
+    echo  [BILGI] Venv bulunamadi, sistem Python kullaniliyor...
+    where python >nul 2>&1
     if errorlevel 1 (
-        echo  [HATA] Python bulunamadi! python.org'dan yukleyin.
+        echo  [HATA] Python bulunamadi!
+        echo  Lutfen python.org adresinden Python yukleyin.
         pause
         exit /b 1
     )
-    set PYTHON=python
-    echo  [BILGI] Sistem Python kullaniliyor.
+    set "PYTHON=python"
 )
 
+echo  Python: !PYTHON!
 echo.
 
-:: Gerekli paketler kurulu mu?
-%PYTHON% -c "import numpy, PIL" >nul 2>&1
+:: Bagimlilik kontrolu
+"%PYTHON%" -c "import numpy, PIL" >nul 2>&1
 if errorlevel 1 (
-    echo  [BILGI] Paketler yukleniyor...
-    %PYTHON% -m pip install numpy pillow
+    echo  [BILGI] Eksik paket kuruluyor...
+    "%PYTHON%" -m pip install numpy pillow
+    echo.
 )
 
+:: Uygulamayi baslat
 echo  Uygulama baslatiliyor...
 echo.
-%PYTHON% rembg_app.py
+"%PYTHON%" "%SCRIPT_DIR%rembg_app.py"
 
 if errorlevel 1 (
     echo.
-    echo  [HATA] Uygulama hatayla kapandi.
+    echo  [HATA] Uygulama hatayla kapandi!
+    echo  Hata kodu: %errorlevel%
     pause
 )
+endlocal
