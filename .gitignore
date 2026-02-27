@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+u2net/
+u2net_human_seg/
+isnet-general-use/
+silueta/
+# test images (don't commit)
+test_*.jpg
+test_*.png
