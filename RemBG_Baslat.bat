@@ -43,6 +43,21 @@ if errorlevel 1 (
     echo.
 )
 
+:: rembg / onnxruntime (CPU) — bozuk kurulumda sadece .dist-info kalabiliyor
+"%PYTHON%" -c "import onnxruntime, rembg" >nul 2>&1
+if errorlevel 1 (
+    echo  [BILGI] rembg / onnxruntime kuruluyor veya onariliyor...
+    "%PYTHON%" -m pip install --upgrade "rembg[cpu]>=2.0.50" "onnxruntime>=1.23.2"
+    echo.
+    "%PYTHON%" -c "import onnxruntime, rembg" >nul 2>&1
+    if errorlevel 1 (
+        echo  [HATA] onnxruntime yuklenemedi. Manuel:
+        echo    "%PYTHON%" -m pip install --force-reinstall --no-cache-dir onnxruntime
+        pause
+        exit /b 1
+    )
+)
+
 :: Uygulamayi baslat
 echo  Uygulama baslatiliyor...
 echo.

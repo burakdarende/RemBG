@@ -8,12 +8,12 @@ Desteklenen Modlar:
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+from collections import Counter
 import os
-import sys
 import time
 import numpy as np
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 # ─────────────────────────────────────────────
 #  COLOUR TOKENS
@@ -36,12 +36,30 @@ BORDER       = "#2d2b55"
 BTN_HOVER    = "#6d28d9"
 SUPPORTED    = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 
+# Renk önayarları: off | auto | vivid | soft
+COLOR_PRESET_LABELS = {
+    "off": "Kapalı",
+    "auto": "Otomatik (seviye + ışık)",
+    "vivid": "Canlı (renk + kontrast)",
+    "soft": "Yumuşak (solukları aç)",
+}
+
 
 def human_size(n):
     for u in ("B","KB","MB","GB"):
         if n < 1024: return f"{n:.1f} {u}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def load_image_exif_safe(path: Path | str) -> Image.Image:
+    """EXIF Orientation uygula — dikey JPG/HEIC vb. için boyut/oran doğru olsun."""
+    img = Image.open(path)
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    return img
 
 
 # ─────────────────────────────────────────────
@@ -137,6 +155,137 @@ def remove_ai_bg(img: Image.Image, session, alpha_matting: bool,
     return result
 
 
+def trim_transparent_rgba(
+    img: Image.Image,
+    margin_ratio: float = 0.04,
+    min_margin: int = 14,
+    alpha_thresh: int = 8,
+) -> Image.Image:
+    """
+    Alfa kanalına göre içeriği saran bbox + pay ile kırpar; nesneyi görüntüde ortalar.
+    Kenar payı: max(genişlik,yükseklik) * margin_ratio ile alt sınır min_margin.
+    """
+    rgba = img.convert("RGBA")
+    alpha = np.array(rgba.split()[-1], dtype=np.uint8)
+    ys, xs = np.where(alpha > alpha_thresh)
+    if xs.size == 0:
+        return rgba
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    w, h = rgba.size
+    bw, bh = x1 - x0 + 1, y1 - y0 + 1
+    m = max(min_margin, int(max(bw, bh) * margin_ratio))
+    x0 = max(0, x0 - m)
+    y0 = max(0, y0 - m)
+    x1 = min(w - 1, x1 + m)
+    y1 = min(h - 1, y1 + m)
+    return rgba.crop((x0, y0, x1 + 1, y1 + 1))
+
+
+def auto_levels_rgba(
+    img: Image.Image,
+    alpha_thresh: int = 20,
+    low_pct: float = 2.0,
+    high_pct: float = 98.0,
+) -> Image.Image:
+    """
+    Ön plandaki piksellerin (alfa > eşik) histogramına göre R/G/B kanallarını gerer;
+    düz / soluk ürün fotoğraflarında ışığı canlandırır.
+    """
+    arr = np.asarray(img.convert("RGBA"), dtype=np.float32)
+    a = arr[:, :, 3]
+    m = a > alpha_thresh
+    if not np.any(m):
+        return img
+    out = arr.copy()
+    for c in range(3):
+        sample = arr[:, :, c][m]
+        lo, hi = np.percentile(sample, [low_pct, high_pct])
+        lo = float(np.clip(lo, 0.0, 254.0))
+        hi = float(np.maximum(hi, lo + 1.0))
+        plane = out[:, :, c]
+        scaled = (plane - lo) / (hi - lo) * 255.0
+        out[:, :, c] = np.clip(scaled, 0, 255)
+    out[:, :, 3] = arr[:, :, 3]
+    return Image.fromarray(out.astype(np.uint8), "RGBA")
+
+
+def pil_enhance_rgb_keep_alpha(
+    rgba: Image.Image,
+    *,
+    brightness: float = 1.0,
+    contrast: float = 1.0,
+    color: float = 1.0,
+    sharpness: float = 1.0,
+) -> Image.Image:
+    r, g, b, a = rgba.split()
+    rgb = Image.merge("RGB", (r, g, b))
+    if brightness != 1.0:
+        rgb = ImageEnhance.Brightness(rgb).enhance(brightness)
+    if contrast != 1.0:
+        rgb = ImageEnhance.Contrast(rgb).enhance(contrast)
+    if color != 1.0:
+        rgb = ImageEnhance.Color(rgb).enhance(color)
+    if sharpness != 1.0:
+        rgb = ImageEnhance.Sharpness(rgb).enhance(sharpness)
+    r, g, b = rgb.split()
+    return Image.merge("RGBA", (r, g, b, a))
+
+
+def apply_color_preset(img: Image.Image, preset: str) -> Image.Image:
+    """Arka plan silindikten sonra uygulanır; alfa korunur."""
+    if not preset or preset == "off":
+        return img
+    if preset == "auto":
+        x = auto_levels_rgba(img, alpha_thresh=20, low_pct=2.0, high_pct=98.0)
+        return pil_enhance_rgb_keep_alpha(
+            x, brightness=1.05, contrast=1.06, color=1.08, sharpness=1.0,
+        )
+    if preset == "vivid":
+        x = auto_levels_rgba(img, alpha_thresh=15, low_pct=1.5, high_pct=98.5)
+        return pil_enhance_rgb_keep_alpha(
+            x, brightness=1.03, contrast=1.14, color=1.22, sharpness=1.08,
+        )
+    if preset == "soft":
+        x = auto_levels_rgba(img, alpha_thresh=25, low_pct=5.0, high_pct=95.0)
+        return pil_enhance_rgb_keep_alpha(
+            x, brightness=1.07, contrast=1.05, color=1.06, sharpness=1.02,
+        )
+    return img
+
+
+def downscale_longest_side(img: Image.Image, max_side: int) -> Image.Image:
+    """max_side > 0 ise uzun kenarı bu değere indir (en-boy oranı korunur)."""
+    if max_side <= 0:
+        return img
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    ratio = max_side / float(m)
+    nw = max(1, int(round(w * ratio)))
+    nh = max(1, int(round(h * ratio)))
+    return img.resize((nw, nh), Image.LANCZOS)
+
+
+def save_rgba_png_compressed(
+    img: Image.Image,
+    path: Path,
+    *,
+    max_side: int = 0,
+    compress_level: int = 9,
+) -> None:
+    """zlib seviye 9 + optimize; isteğe bağlı uzun kenar sınırı (dosya boyutunu düşürür)."""
+    out = img.convert("RGBA")
+    out = downscale_longest_side(out, max_side)
+    out.save(
+        path,
+        "PNG",
+        optimize=True,
+        compress_level=min(9, max(0, compress_level)),
+    )
+
+
 # ─────────────────────────────────────────────
 #  MAIN APPLICATION
 # ─────────────────────────────────────────────
@@ -151,6 +300,7 @@ class RemBGApp(tk.Tk):
         self.resizable(True, True)
 
         self._files: list[Path] = []
+        self._out_dir: Path | None = None  # None → çıktı kaynak dosyanın klasörüne
         self._running  = False
         self._stop_evt = threading.Event()
         self._done_count  = 0
@@ -197,7 +347,7 @@ class RemBGApp(tk.Tk):
         hdr.pack_propagate(False)
         tk.Label(hdr, text="✦ RemBG Pro", font=self.F_TITLE,
                  bg=BG_PANEL, fg=ACCENT_GLOW).pack(side=tk.LEFT, padx=20, pady=10)
-        tk.Label(hdr, text="Gelişmiş Arkaplan Silici  ·  3 Farklı Mod",
+        tk.Label(hdr, text="Gelişmiş Arkaplan Silici  ·  AI + kırpma",
                  font=self.F_SUB, bg=BG_PANEL, fg=TEXT_DIM).pack(side=tk.LEFT)
         self._status_badge = tk.Label(hdr, text="● Hazır", font=self.F_BADGE,
                                       bg=BG_PANEL, fg=SUCCESS)
@@ -208,10 +358,50 @@ class RemBGApp(tk.Tk):
         body = tk.Frame(self, bg=BG_DARK)
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
-        left = tk.Frame(body, bg=BG_DARK, width=322)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        left.pack_propagate(False)
-        self._build_left(left)
+        # Sol panel: kaydırılabilir (uzun formlar için)
+        left_outer = tk.Frame(body, bg=BG_DARK, width=348)
+        left_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 10))
+        left_outer.pack_propagate(False)
+
+        self._left_canvas = tk.Canvas(
+            left_outer, bg=BG_DARK, highlightthickness=0, bd=0,
+        )
+        self._left_scroll = ttk.Scrollbar(
+            left_outer, orient=tk.VERTICAL,
+            command=self._left_canvas.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self._left_canvas.configure(yscrollcommand=self._left_scroll.set)
+        self._left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        left_inner = tk.Frame(self._left_canvas, bg=BG_DARK)
+        self._left_canvas_window = self._left_canvas.create_window(
+            (0, 0), window=left_inner, anchor=tk.NW,
+        )
+
+        def _left_inner_cfg(_event=None):
+            self._left_canvas.configure(scrollregion=self._left_canvas.bbox("all"))
+
+        def _left_canvas_cfg(event):
+            self._left_canvas.itemconfigure(self._left_canvas_window, width=event.width)
+
+        left_inner.bind("<Configure>", _left_inner_cfg)
+        self._left_canvas.bind("<Configure>", _left_canvas_cfg)
+
+        def _wheel(event):
+            self._left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_wheel(_e=None):
+            self._left_canvas.bind_all("<MouseWheel>", _wheel)
+
+        def _unbind_wheel(_e=None):
+            self._left_canvas.unbind_all("<MouseWheel>")
+
+        left_outer.bind("<Enter>", _bind_wheel)
+        left_outer.bind("<Leave>", _unbind_wheel)
+
+        self._build_left(left_inner)
 
         right = tk.Frame(body, bg=BG_DARK)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -234,8 +424,10 @@ class RemBGApp(tk.Tk):
              "Siyah / koyu bg — Neon, tel kafes, çizgi sanatı"),
             ("light", "☀️  Açık Arkaplan Sil",
              "Beyaz / açık bg — Logo, tarama, flat illüstrasyon"),
+            ("ai_studio", "🎯  AI Nesne Ayırma (stüdyo / ürün)",
+             "Beyaz-gri arka plan fark etmez — nesneyi korur, çevreyi siler (ISNet)"),
             ("ai",    "🤖  AI Segmentasyon (rembg)",
-             "Fotoğraf, insan, nesne — Akıllı kesim"),
+             "Model seç — genel foto, insan, detay"),
         ]
         for val, label, tip in modes:
             rb_frame = tk.Frame(mode_frame, bg=BG_CARD)
@@ -262,6 +454,98 @@ class RemBGApp(tk.Tk):
         self._ai_panel.pack(fill=tk.X)
         self._build_ai_panel(self._ai_panel)
 
+        # Stüdyo modu bilgi (sadece ai_studio)
+        self._studio_frame = tk.Frame(p, bg=BG_CARD,
+                                      highlightbackground=BORDER, highlightthickness=1)
+        tk.Label(
+            self._studio_frame,
+            text="ISNet — varsayılan hızlı (alpha matting kapalı).\n"
+                 "İstersen aşağıdan matting aç; yumuşak saçak ama çok daha yavaş (CPU).",
+            font=("Segoe UI", 8), bg=BG_CARD, fg=TEXT_MUTED, justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=10, pady=(8, 4))
+        self._studio_matting_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            self._studio_frame,
+            text="Alpha matting (yumuşak kenar — yavaş, pymatting)",
+            variable=self._studio_matting_var,
+            font=self.F_SMALL,
+            bg=BG_CARD, fg=TEXT_MAIN, selectcolor=ACCENT,
+            activebackground=BG_CARD, activeforeground=ACCENT_GLOW,
+            bd=0, cursor="hand2",
+        ).pack(anchor=tk.W, padx=10, pady=(0, 8))
+
+        # Çıktı: kırpma
+        self._section(p, "📐  Çıktı")
+        out_frm = tk.Frame(p, bg=BG_CARD,
+                           highlightbackground=BORDER, highlightthickness=1)
+        out_frm.pack(fill=tk.X, pady=(0, 8))
+        self._trim_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            out_frm,
+            text="Fazla boşluğu kırp ve nesneyi ortala (şeffaf kenarları at)",
+            variable=self._trim_var, font=self.F_SMALL,
+            bg=BG_CARD, fg=TEXT_MAIN, selectcolor=ACCENT,
+            activebackground=BG_CARD, activeforeground=ACCENT_GLOW,
+            bd=0, cursor="hand2",
+        ).pack(anchor=tk.W, padx=10, pady=(8, 4))
+        row_m = tk.Frame(out_frm, bg=BG_CARD)
+        row_m.pack(fill=tk.X, padx=10, pady=(0, 8))
+        tk.Label(row_m, text="Kenar payı (%)", font=self.F_SMALL,
+                 bg=BG_CARD, fg=TEXT_DIM).pack(side=tk.LEFT)
+        self._margin_lbl = tk.Label(row_m, text="4", width=4,
+                                    font=self.F_SMALL, bg=BG_CARD, fg=ACCENT_GLOW)
+        self._margin_lbl.pack(side=tk.RIGHT)
+        self._margin_var = tk.IntVar(value=4)
+        ttk.Scale(
+            out_frm, from_=2, to=12,
+            variable=self._margin_var, orient=tk.HORIZONTAL,
+            command=lambda v: self._margin_lbl.config(text=str(int(float(v)))),
+        ).pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        row_side = tk.Frame(out_frm, bg=BG_CARD)
+        row_side.pack(fill=tk.X, padx=10, pady=(0, 2))
+        tk.Label(row_side, text="Max uzun kenar (px)", font=self.F_SMALL,
+                 bg=BG_CARD, fg=TEXT_MAIN).pack(side=tk.LEFT)
+        self._max_side_lbl = tk.Label(row_side, text="2048", width=5,
+                                      font=self.F_SMALL, bg=BG_CARD, fg=ACCENT_GLOW)
+        self._max_side_lbl.pack(side=tk.RIGHT)
+        self._max_side_var = tk.IntVar(value=2048)
+        ttk.Scale(
+            out_frm, from_=0, to=4096,
+            variable=self._max_side_var, orient=tk.HORIZONTAL,
+            command=lambda v: self._max_side_lbl.config(
+                text=str(int(float(v))) if int(float(v)) > 0 else "0 (tam)"
+            ),
+        ).pack(fill=tk.X, padx=10, pady=(0, 4))
+        tk.Label(
+            out_frm,
+            text="0 = çözünürlük aynı, yalnızca PNG sıkıştırma  |  2048 ≈ web/ürün (~2–4 MB)\n"
+                 "Düşük değer = daha küçük dosya, biraz daha yumuşak detay",
+            font=("Segoe UI", 8), bg=BG_CARD, fg=TEXT_MUTED, justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=10, pady=(0, 6))
+
+        tk.Frame(out_frm, bg=BORDER, height=1).pack(fill=tk.X, padx=10, pady=(2, 6))
+        tk.Label(out_frm, text="Renk / ışık", font=self.F_LABEL,
+                 bg=BG_CARD, fg=ACCENT_GLOW).pack(anchor=tk.W, padx=10, pady=(0, 4))
+        self._color_preset = tk.StringVar(value="off")
+        color_opts = [
+            ("off", "Kapalı", "Sadece kesim; renge dokunulmaz"),
+            ("auto", "Otomatik", "Histogram denge + hafif parlaklık / doygunluk"),
+            ("vivid", "Canlı", "Doygunluk, kontrast, hafif keskinlik"),
+            ("soft", "Yumuşak", "Soluk görselleri nazikçe açar"),
+        ]
+        for val, title, tip in color_opts:
+            cf = tk.Frame(out_frm, bg=BG_CARD)
+            cf.pack(fill=tk.X)
+            tk.Radiobutton(
+                cf, text=title, variable=self._color_preset, value=val,
+                font=self.F_SMALL, bg=BG_CARD, fg=TEXT_MAIN, selectcolor=ACCENT,
+                activebackground=BG_CARD, activeforeground=ACCENT_GLOW,
+                bd=0, cursor="hand2",
+            ).pack(anchor=tk.W, padx=10, pady=(3, 0))
+            tk.Label(cf, text=tip, font=("Segoe UI", 8),
+                     bg=BG_CARD, fg=TEXT_MUTED).pack(anchor=tk.W, padx=28, pady=(0, 4))
+
         self._on_mode_change()          # show correct panel
 
         # ── FILE / FOLDER ──────────────────────
@@ -273,6 +557,27 @@ class RemBGApp(tk.Tk):
         self._mk_btn(btn_wrap, "🗑️  Listeyi Temizle",
                      self._clear_queue, bg=BG_CARD2,
                      hover=BG_CARD, color=TEXT_MUTED).pack(fill=tk.X, pady=2)
+
+        self._section(p, "💾  Çıktı klasörü")
+        outdir_card = tk.Frame(p, bg=BG_CARD,
+                               highlightbackground=BORDER, highlightthickness=1)
+        outdir_card.pack(fill=tk.X, pady=(0, 8))
+        self._outdir_lbl = tk.Label(
+            outdir_card,
+            text="Kaynak dosyanın yanına kaydet (varsayılan)",
+            font=("Segoe UI", 8), bg=BG_CARD, fg=TEXT_MUTED,
+            wraplength=300, justify=tk.LEFT,
+        )
+        self._outdir_lbl.pack(anchor=tk.W, padx=10, pady=(8, 6))
+        od_row = tk.Frame(outdir_card, bg=BG_CARD)
+        od_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self._mk_btn(od_row, "📂  Klasör seç", self._pick_out_dir,
+                     font=self.F_SMALL, pady=6).pack(side=tk.LEFT, fill=tk.X,
+                                                      expand=True, padx=(0, 4))
+        self._mk_btn(od_row, "↩  Varsayılan", self._reset_out_dir,
+                     bg=BG_CARD2, hover=BG_CARD, color=TEXT_MUTED,
+                     font=self.F_SMALL, pady=6).pack(side=tk.LEFT, fill=tk.X,
+                                                     expand=True)
 
         self._queue_lbl = tk.Label(p, text="0 dosya sıraya eklendi",
                                    font=self.F_SMALL, bg=BG_DARK, fg=TEXT_DIM)
@@ -377,13 +682,15 @@ class RemBGApp(tk.Tk):
                            activeforeground=ACCENT_GLOW, bd=0,
                            cursor="hand2").pack(anchor=tk.W, padx=10, pady=2)
 
-        self._alpha_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(frm, text="Alpha matting (yumuşak kenar)",
-                       variable=self._alpha_var, font=self.F_SMALL,
-                       bg=BG_CARD, fg=TEXT_MAIN, selectcolor=ACCENT,
-                       activebackground=BG_CARD, activeforeground=ACCENT_GLOW,
-                       bd=0, cursor="hand2").pack(anchor=tk.W, padx=10,
-                                                  pady=(4, 8))
+        self._alpha_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            frm,
+            text="Alpha matting (yumuşak kenar — CPU’da yavaş)",
+            variable=self._alpha_var, font=self.F_SMALL,
+            bg=BG_CARD, fg=TEXT_MAIN, selectcolor=ACCENT,
+            activebackground=BG_CARD, activeforeground=ACCENT_GLOW,
+            bd=0, cursor="hand2",
+        ).pack(anchor=tk.W, padx=10, pady=(4, 8))
 
     # ── RIGHT LOG + PROGRESS ───────────────────
     def _build_right(self, p):
@@ -470,8 +777,14 @@ class RemBGApp(tk.Tk):
         if mode in ("dark", "light"):
             self._lum_panel.pack(fill=tk.X)
             self._ai_panel.pack_forget()
+            self._studio_frame.pack_forget()
+        elif mode == "ai_studio":
+            self._lum_panel.pack_forget()
+            self._ai_panel.pack_forget()
+            self._studio_frame.pack(fill=tk.X, pady=(0, 8))
         else:
             self._lum_panel.pack_forget()
+            self._studio_frame.pack_forget()
             self._ai_panel.pack(fill=tk.X)
 
     # ── DEPENDENCY CHECK ───────────────────────
@@ -481,8 +794,16 @@ class RemBGApp(tk.Tk):
             self._log_w("✦ rembg yüklü — AI modu kullanılabilir.\n", "ok")
         except ImportError:
             self._log_w("⚠  rembg kurulu değil (AI modu çalışmaz)\n", "warn")
-            self._log_w("   pip install rembg[gpu]\n", "warn")
+            self._log_w("   pip install rembg\n", "warn")
         self._log_w("✦ Lüminan modları hazır (rembg gerekmez).\n", "ok")
+        self._log_w(
+            "ℹ AI hızı: onnxruntime CPU (varsayılan). GPU için CUDA + onnxruntime-gpu gerekir.\n",
+            "dim",
+        )
+        self._log_w(
+            "ℹ Alpha matting kapalı = çok daha hızlı (Cholesky/pymatting yok).\n",
+            "dim",
+        )
         self._log_w("✦ Dosya veya klasör seçip işlemi başlatın.\n\n", "title")
 
     # ── FILE/FOLDER PICK ───────────────────────
@@ -531,6 +852,43 @@ class RemBGApp(tk.Tk):
         self._update_q()
         self._log_w("🗑  Liste temizlendi.\n", "dim")
 
+    def _short_path(self, p: Path, max_len: int = 52) -> str:
+        s = str(p.resolve())
+        if len(s) <= max_len:
+            return s
+        return "…" + s[-(max_len - 1) :]
+
+    def _update_outdir_label(self):
+        if self._out_dir is None:
+            self._outdir_lbl.config(
+                text="Kaynak dosyanın yanına kaydet (varsayılan)",
+                fg=TEXT_MUTED,
+            )
+        else:
+            self._outdir_lbl.config(
+                text=self._short_path(self._out_dir),
+                fg=ACCENT_GLOW,
+            )
+
+    def _pick_out_dir(self):
+        d = filedialog.askdirectory(title="PNG çıktı klasörü")
+        if not d:
+            return
+        self._out_dir = Path(d)
+        try:
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Hata", f"Klasör oluşturulamadı:\n{e}")
+            self._out_dir = None
+            return
+        self._update_outdir_label()
+        self._log_w(f"✔  Çıktı klasörü: {self._out_dir.resolve()}\n", "ok")
+
+    def _reset_out_dir(self):
+        self._out_dir = None
+        self._update_outdir_label()
+        self._log_w("↩  Çıktı: kaynak klasörler (varsayılan).\n", "dim")
+
     # ── LOG ────────────────────────────────────
     def _log_w(self, msg, tag="info"):
         self._log.config(state=tk.NORMAL)
@@ -552,7 +910,7 @@ class RemBGApp(tk.Tk):
             return
 
         mode = self._mode_var.get()
-        if mode == "ai":
+        if mode in ("ai", "ai_studio"):
             try:
                 import rembg  # noqa
             except ImportError:
@@ -560,7 +918,7 @@ class RemBGApp(tk.Tk):
                     "Hata",
                     "rembg kurulu değil.\n"
                     "Koyu/Açık Arkaplan modlarını kullanın\n"
-                    "veya: pip install rembg[gpu]")
+                    "veya: pip install rembg")
                 return
 
         self._running = True
@@ -581,6 +939,12 @@ class RemBGApp(tk.Tk):
             despill   = self._despill_var.get(),
             model     = self._model_var.get(),
             alpha     = self._alpha_var.get(),
+            trim      = self._trim_var.get(),
+            margin_pct= self._margin_var.get(),
+            out_dir      = self._out_dir,
+            max_side     = self._max_side_var.get(),
+            color_preset   = self._color_preset.get(),
+            studio_matting = self._studio_matting_var.get(),
         )
         threading.Thread(target=self._worker, kwargs=params, daemon=True).start()
 
@@ -591,26 +955,66 @@ class RemBGApp(tk.Tk):
 
     # ── WORKER ─────────────────────────────────
     def _worker(self, files, mode, threshold, softness, despill,
-                model, alpha):
+                model, alpha, trim, margin_pct, out_dir, max_side,
+                color_preset, studio_matting):
         total = len(files)
-        self.after(0, lambda: self._log_w(
-            f"\n{'─'*56}\n"
-            f"  Mod    : {mode.upper()}\n"
-            f"  Eşik   : {threshold}  Yumuşaklık: {softness}\n"
-            f"  Toplam : {total} dosya\n"
-            f"{'─'*56}\n\n", "title"))
+        margin_note = (
+            f"  Kırpma : {'açık' if trim else 'kapalı'}  (kenar payı %{margin_pct})\n"
+        )
+        side_note = (
+            f"  Boyut  : uzun kenar ≤ {max_side} px  |  PNG zlib=9\n"
+            if max_side > 0
+            else "  Boyut  : orijinal çözünürlük  |  PNG zlib=9\n"
+        )
+        def _hdr():
+            lines = [f"\n{'─'*56}\n", f"  Mod    : {mode.upper()}\n"]
+            if mode in ("dark", "light"):
+                lines.append(
+                    f"  Eşik   : {threshold}  Yumuşaklık: {softness}\n"
+                )
+            lines.append(margin_note)
+            lines.append(side_note)
+            if out_dir is not None:
+                lines.append(f"  Çıktı  : {out_dir.resolve()}\n")
+            else:
+                lines.append("  Çıktı  : her dosyanın kaynak klasörü\n")
+            lines.append(
+                f"  Renk   : {COLOR_PRESET_LABELS.get(color_preset, color_preset)}\n"
+            )
+            if mode == "ai_studio":
+                lines.append(
+                    "  Matting: "
+                    + (
+                        "açık (yavaş)\n"
+                        if studio_matting
+                        else "kapalı — hızlı (önerilen)\n"
+                    )
+                )
+            elif mode == "ai":
+                lines.append(
+                    "  Matting: "
+                    + ("açık (yavaş)\n" if alpha else "kapalı — hızlı\n")
+                )
+            lines.extend([f"  Toplam : {total} dosya\n", f"{'─'*56}\n\n"])
+            self._log_w("".join(lines), "title")
+
+        self.after(0, _hdr)
 
         self.after(0, lambda: self._bar.config(maximum=total, value=0))
 
         # AI session (only if needed)
         session = None
-        if mode == "ai":
+        ai_model = model
+        if mode == "ai_studio":
+            ai_model = "isnet-general-use"
+        if mode in ("ai", "ai_studio"):
             self.after(0, lambda: self._sb.config(text="Model yükleniyor…"))
             self.after(0, lambda: self._log_w("⏳ AI modeli yükleniyor…\n", "warn"))
             try:
                 from rembg import new_session
-                session = new_session(model)
-                self.after(0, lambda: self._log_w("✔  Model hazır.\n\n", "ok"))
+                session = new_session(ai_model)
+                self.after(0, lambda m=ai_model:
+                           self._log_w(f"✔  Model hazır: {m}\n\n", "ok"))
             except Exception as e:
                 self.after(0, lambda err=str(e):
                            self._log_w(f"❌ Model yüklenemedi: {err}\n", "err"))
@@ -618,6 +1022,8 @@ class RemBGApp(tk.Tk):
                 return
 
         t0 = time.time()
+        stem_counts = Counter(f.stem for f in files)
+        stem_idx = Counter()
 
         for idx, fp in enumerate(files, 1):
             if self._stop_evt.is_set():
@@ -627,7 +1033,13 @@ class RemBGApp(tk.Tk):
             self.after(0, lambda s=info: self._sb.config(text=s))
             self.after(0, lambda s=info: self._log_w(f"{s}\n", "info"))
 
-            out = fp.parent / (fp.stem + "_rmbg.png")
+            base = out_dir if out_dir is not None else fp.parent
+            stem_idx[fp.stem] += 1
+            if stem_counts[fp.stem] > 1:
+                fname = f"{fp.stem}_{stem_idx[fp.stem]}_rmbg.png"
+            else:
+                fname = fp.stem + "_rmbg.png"
+            out = base / fname
             if out.exists():
                 self.after(0, lambda o=out:
                            self._log_w(f"   ↷ Atlandı (mevcut): {o.name}\n", "warn"))
@@ -638,24 +1050,39 @@ class RemBGApp(tk.Tk):
                 continue
 
             try:
-                img = Image.open(fp)
+                img = load_image_exif_safe(fp)
                 orig = img.size
 
                 if mode == "dark":
                     result = remove_dark_bg(img, threshold, softness, despill)
                 elif mode == "light":
                     result = remove_light_bg(img, threshold, softness, despill)
+                elif mode == "ai_studio":
+                    result = remove_ai_bg(
+                        img, session, studio_matting,
+                        fg_thresh=240, bg_thresh=10, erode=10,
+                    )
                 else:
-                    result = remove_ai_bg(img, session, alpha,
-                                          fg_thresh=240,
-                                          bg_thresh=10,
-                                          erode=10)
+                    result = remove_ai_bg(
+                        img, session, alpha,
+                        fg_thresh=240, bg_thresh=10, erode=10,
+                    )
 
-                # Ensure resolution untouched
+                # Ensure resolution untouched (kırpmadan önce)
                 if result.size != orig:
                     result = result.resize(orig, Image.LANCZOS)
 
-                result.save(out, "PNG", optimize=False)
+                if trim:
+                    mr = max(0.02, min(0.15, margin_pct / 100.0))
+                    result = trim_transparent_rgba(
+                        result, margin_ratio=mr, min_margin=14, alpha_thresh=8
+                    )
+
+                result = apply_color_preset(result, color_preset)
+
+                save_rgba_png_compressed(
+                    result, out, max_side=max_side, compress_level=9,
+                )
                 sz = human_size(out.stat().st_size)
                 self.after(0, lambda o=out, s=sz:
                            self._log_w(f"   ✔ Kaydedildi → {o.name}  ({s})\n", "ok"))

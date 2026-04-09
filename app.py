@@ -15,7 +15,7 @@ from flask import (
     Flask, request, jsonify, send_file,
     render_template_string, abort
 )
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 from werkzeug.utils import secure_filename
 
 # ── Logging ────────────────────────────────────────────────────────────────
@@ -110,6 +110,109 @@ def remove_ai_bg(img: Image.Image, model: str, alpha_matting: bool) -> Image.Ima
     return result
 
 
+def trim_transparent_rgba(
+    img: Image.Image,
+    margin_ratio: float = 0.04,
+    min_margin: int = 14,
+    alpha_thresh: int = 8,
+) -> Image.Image:
+    rgba = img.convert("RGBA")
+    alpha = np.array(rgba.split()[-1], dtype=np.uint8)
+    ys, xs = np.where(alpha > alpha_thresh)
+    if xs.size == 0:
+        return rgba
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    w, h = rgba.size
+    bw, bh = x1 - x0 + 1, y1 - y0 + 1
+    m = max(min_margin, int(max(bw, bh) * margin_ratio))
+    x0 = max(0, x0 - m)
+    y0 = max(0, y0 - m)
+    x1 = min(w - 1, x1 + m)
+    y1 = min(h - 1, y1 + m)
+    return rgba.crop((x0, y0, x1 + 1, y1 + 1))
+
+
+def auto_levels_rgba(
+    img: Image.Image,
+    alpha_thresh: int = 20,
+    low_pct: float = 2.0,
+    high_pct: float = 98.0,
+) -> Image.Image:
+    arr = np.asarray(img.convert("RGBA"), dtype=np.float32)
+    a = arr[:, :, 3]
+    m = a > alpha_thresh
+    if not np.any(m):
+        return img
+    out = arr.copy()
+    for c in range(3):
+        sample = arr[:, :, c][m]
+        lo, hi = np.percentile(sample, [low_pct, high_pct])
+        lo = float(np.clip(lo, 0.0, 254.0))
+        hi = float(np.maximum(hi, lo + 1.0))
+        plane = out[:, :, c]
+        scaled = (plane - lo) / (hi - lo) * 255.0
+        out[:, :, c] = np.clip(scaled, 0, 255)
+    out[:, :, 3] = arr[:, :, 3]
+    return Image.fromarray(out.astype(np.uint8), "RGBA")
+
+
+def pil_enhance_rgb_keep_alpha(
+    rgba: Image.Image,
+    *,
+    brightness: float = 1.0,
+    contrast: float = 1.0,
+    color: float = 1.0,
+    sharpness: float = 1.0,
+) -> Image.Image:
+    r, g, b, a = rgba.split()
+    rgb = Image.merge("RGB", (r, g, b))
+    if brightness != 1.0:
+        rgb = ImageEnhance.Brightness(rgb).enhance(brightness)
+    if contrast != 1.0:
+        rgb = ImageEnhance.Contrast(rgb).enhance(contrast)
+    if color != 1.0:
+        rgb = ImageEnhance.Color(rgb).enhance(color)
+    if sharpness != 1.0:
+        rgb = ImageEnhance.Sharpness(rgb).enhance(sharpness)
+    r, g, b = rgb.split()
+    return Image.merge("RGBA", (r, g, b, a))
+
+
+def apply_color_preset(img: Image.Image, preset: str) -> Image.Image:
+    if not preset or preset == "off":
+        return img
+    if preset == "auto":
+        x = auto_levels_rgba(img, alpha_thresh=20, low_pct=2.0, high_pct=98.0)
+        return pil_enhance_rgb_keep_alpha(
+            x, brightness=1.05, contrast=1.06, color=1.08, sharpness=1.0,
+        )
+    if preset == "vivid":
+        x = auto_levels_rgba(img, alpha_thresh=15, low_pct=1.5, high_pct=98.5)
+        return pil_enhance_rgb_keep_alpha(
+            x, brightness=1.03, contrast=1.14, color=1.22, sharpness=1.08,
+        )
+    if preset == "soft":
+        x = auto_levels_rgba(img, alpha_thresh=25, low_pct=5.0, high_pct=95.0)
+        return pil_enhance_rgb_keep_alpha(
+            x, brightness=1.07, contrast=1.05, color=1.06, sharpness=1.02,
+        )
+    return img
+
+
+def downscale_longest_side(img: Image.Image, max_side: int) -> Image.Image:
+    if max_side <= 0:
+        return img
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    ratio = max_side / float(m)
+    nw = max(1, int(round(w * ratio)))
+    nh = max(1, int(round(h * ratio)))
+    return img.resize((nw, nh), Image.LANCZOS)
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
@@ -143,10 +246,19 @@ def process():
     despill    = request.form.get("despill", "true").lower() == "true"
     model      = request.form.get("model", "silueta")
     do_alpha   = request.form.get("alpha", "false").lower() == "true"
+    studio_matting = request.form.get("studio_matting", "false").lower() == "true"
+    do_trim    = request.form.get("trim", "false").lower() == "true"
+    margin_pct = int(request.form.get("margin_pct", "4"))
+    max_side     = int(request.form.get("max_side", "2048"))
+    color_preset = request.form.get("color_preset", "off")
 
     # Clamp values
     threshold = max(0, min(threshold, 255))
     softness  = max(1, min(softness, 200))
+    margin_pct = max(2, min(margin_pct, 12))
+    max_side = max(0, min(max_side, 8192))
+    if color_preset not in ("off", "auto", "vivid", "soft"):
+        color_preset = "off"
 
     # ── Load image in-memory ────────────────────────────────────────────
     try:
@@ -155,6 +267,10 @@ def process():
             return jsonify({"error": f"Dosya çok büyük (max {MAX_FILE_MB} MB)"}), 413
 
         img = Image.open(io.BytesIO(raw_bytes))
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
         orig_size = img.size
         log.info(f"İşleniyor: mode={mode} model={model} size={orig_size}")
     except Exception as e:
@@ -172,6 +288,8 @@ def process():
             result = remove_light_bg(img, threshold, softness, despill)
         elif mode == "ai":
             result = remove_ai_bg(img, model, do_alpha)
+        elif mode == "ai_studio":
+            result = remove_ai_bg(img, "isnet-general-use", studio_matting)
         else:
             return jsonify({"error": "Geçersiz mod"}), 400
     except Exception as e:
@@ -184,13 +302,22 @@ def process():
     elapsed = time.time() - t0
     log.info(f"Tamamlandı: {elapsed:.2f}s")
 
-    # ── Ensure original resolution ──────────────────────────────────────
+    # ── Ensure original resolution (kırpmadan önce) ──────────────────────
     if result.size != orig_size:
         result = result.resize(orig_size, Image.LANCZOS)
 
-    # ── Encode to PNG in memory ─────────────────────────────────────────
+    if do_trim:
+        mr = max(0.02, min(0.15, margin_pct / 100.0))
+        result = trim_transparent_rgba(
+            result, margin_ratio=mr, min_margin=14, alpha_thresh=8
+        )
+
+    result = apply_color_preset(result, color_preset)
+    result = downscale_longest_side(result.convert("RGBA"), max_side)
+
+    # ── Encode to PNG in memory (zlib 9) ────────────────────────────────
     buf = io.BytesIO()
-    result.save(buf, format="PNG", optimize=False)
+    result.save(buf, format="PNG", optimize=True, compress_level=9)
     buf.seek(0)
     del result
     gc.collect()
@@ -606,10 +733,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </div>
         </label>
         <label class="mode-option">
+          <input type="radio" name="mode" value="ai_studio">
+          <div>
+            <div class="mode-title">🎯 AI Nesne (stüdyo / ürün)</div>
+            <div class="mode-desc">ISNet — hızlı varsayılan; matting isteğe bağlı</div>
+          </div>
+        </label>
+        <label class="mode-option">
           <input type="radio" name="mode" value="ai">
           <div>
             <div class="mode-title">🤖 AI Segmentasyon</div>
-            <div class="mode-desc">Fotoğraf, insan, nesne — Akıllı kesim</div>
+            <div class="mode-desc">Fotoğraf, insan, nesne — Model seç</div>
           </div>
         </label>
       </div>
@@ -637,6 +771,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </label>
     </div>
 
+    <div class="card" id="studio-panel" style="margin-bottom:14px;display:none">
+      <div class="section-title">🎯 Stüdyo modu</div>
+      <p style="font-size:.82rem;color:var(--muted);line-height:1.55">
+        Varsayılan hızlı: sadece ISNet (CPU). İnce saçak istiyorsan matting aç — yavaşlar.
+      </p>
+      <label class="checkbox-row" style="margin-top:8px">
+        <input type="checkbox" id="studio-matting">
+        Alpha matting (yumuşak kenar, çok yavaş — pymatting)
+      </label>
+    </div>
+
     <!-- AI params -->
     <div class="card" id="ai-panel" style="margin-bottom:14px">
       <div class="section-title">🤖 AI Model</div>
@@ -648,6 +793,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <input type="checkbox" id="alpha-matting">
         Alpha matting (yumuşak kenar, yavaşlatır)
       </label>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="section-title">📐 Çıktı</div>
+      <label class="checkbox-row">
+        <input type="checkbox" id="trim-crop" checked>
+        Fazla boşluğu kırp (şeffaf alanları at, nesneyi ortala)
+      </label>
+      <div class="param-row" style="margin-top:10px">
+        <label>Kenar payı (%)</label>
+        <span class="val" id="margin-val">4</span>
+      </div>
+      <input type="range" id="margin-pct" min="2" max="12" value="4">
+      <div class="param-row" style="margin-top:10px">
+        <label>Max uzun kenar (px)</label>
+        <span class="val" id="max-side-val">2048</span>
+      </div>
+      <input type="range" id="max-side" min="0" max="4096" step="64" value="2048">
+      <p style="font-size:.73rem;color:var(--muted);margin-top:6px;line-height:1.45">
+        0 = boyut aynı, yalnızca PNG sıkıştırma · 2048 ≈ daha küçük dosya (~2–5 MB)
+      </p>
+      <div class="section-title" style="margin-top:12px">Renk / ışık</div>
+      <div class="mode-grid" style="gap:2px">
+        <label class="mode-option" style="padding:6px 10px">
+          <input type="radio" name="color_preset" value="off" checked>
+          <div><div class="mode-title">Kapalı</div><div class="mode-desc">Ham renk</div></div>
+        </label>
+        <label class="mode-option" style="padding:6px 10px">
+          <input type="radio" name="color_preset" value="auto">
+          <div><div class="mode-title">Otomatik</div><div class="mode-desc">Histogram + hafif canlılık</div></div>
+        </label>
+        <label class="mode-option" style="padding:6px 10px">
+          <input type="radio" name="color_preset" value="vivid">
+          <div><div class="mode-title">Canlı</div><div class="mode-desc">Doygunluk + kontrast</div></div>
+        </label>
+        <label class="mode-option" style="padding:6px 10px">
+          <input type="radio" name="color_preset" value="soft">
+          <div><div class="mode-title">Yumuşak</div><div class="mode-desc">Solukları nazikçe aç</div></div>
+        </label>
+      </div>
     </div>
 
     <!-- Process button -->
@@ -704,6 +889,7 @@ const previewOrig = document.getElementById('preview-orig');
 const statusBadge = document.getElementById('status-badge');
 const lumPanel    = document.getElementById('lum-panel');
 const aiPanel     = document.getElementById('ai-panel');
+const studioPanel = document.getElementById('studio-panel');
 
 let selectedFile = null;
 
@@ -747,9 +933,15 @@ document.querySelectorAll('input[name="mode"]').forEach(rb => {
     if (rb.value === 'ai') {
       lumPanel.style.display = 'none';
       aiPanel.style.display = 'block';
+      studioPanel.style.display = 'none';
+    } else if (rb.value === 'ai_studio') {
+      lumPanel.style.display = 'none';
+      aiPanel.style.display = 'none';
+      studioPanel.style.display = 'block';
     } else {
       lumPanel.style.display = 'block';
       aiPanel.style.display = 'none';
+      studioPanel.style.display = 'none';
     }
   });
 });
@@ -767,6 +959,16 @@ document.getElementById('threshold').addEventListener('input', function() {
 });
 document.getElementById('softness').addEventListener('input', function() {
   document.getElementById('soft-val').textContent = this.value;
+});
+document.getElementById('margin-pct').addEventListener('input', function() {
+  document.getElementById('margin-val').textContent = this.value;
+});
+function updateMaxSideLabel(v) {
+  const n = parseInt(v, 10);
+  document.getElementById('max-side-val').textContent = n === 0 ? '0 (tam)' : String(n);
+}
+document.getElementById('max-side').addEventListener('input', function() {
+  updateMaxSideLabel(this.value);
 });
 
 // ── Process ──────────────────────────────────────────────────────────────
@@ -788,12 +990,18 @@ btnProcess.addEventListener('click', async () => {
   fd.append('despill', despill);
   fd.append('model', model);
   fd.append('alpha', alpha);
+  fd.append('trim', document.getElementById('trim-crop').checked);
+  fd.append('margin_pct', document.getElementById('margin-pct').value);
+  fd.append('max_side', document.getElementById('max-side').value);
+  fd.append('color_preset', document.querySelector('input[name="color_preset"]:checked').value);
+  fd.append('studio_matting', document.getElementById('studio-matting').checked);
 
   // UI: loading
   btnProcess.disabled = true;
   progressWrap.classList.add('visible');
   pbar.classList.add('indeterminate');
-  statusText.textContent = mode === 'ai' ? 'AI modeli yükleniyor (ilk çalıştırmada ~30 sn)…' : 'İşleniyor…';
+  statusText.textContent = (mode === 'ai' || mode === 'ai_studio')
+    ? 'AI modeli yükleniyor (ilk çalıştırmada ~30 sn)…' : 'İşleniyor…';
   resultPanel.classList.remove('visible');
   hideError();
   setStatus('İşleniyor…', 'warning');
